@@ -1,7 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Duration, Effect, Layer, Schedule, Schema, Semaphore, Context } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
-import { formatPatch, structuredPatch } from "diff"
+
 import path from "path"
 import { AppProcess } from "@opencode-ai/core/process"
 import { InstanceState } from "@/effect/instance-state"
@@ -733,19 +733,33 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | AppProcess.Service | C
               }
 
               const step = 100
-              const patch = (file: string, before: string, after: string) =>
-                formatPatch(structuredPatch(file, file, before, after, "", "", { context: Number.MAX_SAFE_INTEGER }))
 
               for (let i = 0; i < rows.length; i += step) {
                 const run = rows.slice(i, i + step)
-                const text = yield* load(run)
+
+                // Use git diff subprocess instead of the synchronous JS `diff` library
+                // (formatPatch/structuredPatch with Number.MAX_SAFE_INTEGER context lines
+                // blocks the event loop and freezes the TUI on large sessions).
+                const diff = yield* git(
+                  [
+                    ...quote,
+                    ...args(["diff", "--no-ext-diff", "--no-renames", from, to, "--", ...run.map((r) => r.file)]),
+                  ],
+                  { cwd: state.directory },
+                )
+                const patches = new Map<string, string>()
+                if (diff.code === 0 && diff.text.trim()) {
+                  for (const part of diff.text.split(/^(?=diff --git )/m)) {
+                    if (!part.trim()) continue
+                    const match = part.match(/^diff --git a\/(.+?) b\//)
+                    if (match) patches.set(match[1], part.trim())
+                  }
+                }
 
                 for (const row of run) {
-                  const hit = text?.get(row.file) ?? { before: "", after: "" }
-                  const [before, after] = row.binary ? ["", ""] : text ? [hit.before, hit.after] : yield* show(row)
                   result.push({
                     file: row.file,
-                    patch: row.binary ? "" : patch(row.file, before, after),
+                    patch: row.binary ? "" : (patches.get(row.file) ?? ""),
                     additions: row.additions,
                     deletions: row.deletions,
                     status: row.status,
