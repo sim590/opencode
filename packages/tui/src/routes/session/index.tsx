@@ -25,7 +25,7 @@ import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner } from "../../component/spinner"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
-import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
+import { BoxRenderable, ScrollBoxRenderable, InputRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
 import type {
   AssistantMessage,
@@ -40,7 +40,7 @@ import type {
 import { useLocal } from "../../context/local"
 import { Locale } from "../../util/locale"
 import { webSearchProviderLabel } from "../../util/tool-display"
-import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
+import { useKeyboard, useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import { useSDK } from "../../context/sdk"
 import { useEditorContext } from "../../context/editor"
 import { openEditor } from "../../editor"
@@ -144,6 +144,7 @@ const sessionBindingCommands = [
 ] as const
 
 const sessionGlobalBindingCommands = [
+  "session.search",
   "session.page.up",
   "session.page.down",
   "session.line.up",
@@ -167,12 +168,143 @@ const context = createContext<{
   providers: () => ReadonlyMap<string, Provider>
   sync: ReturnType<typeof useSync>
   tui: ReturnType<typeof useTuiConfig>
+  searchTerm: () => string
+  searchIndex: () => number
+  searchActive: () => boolean
+  searchMatches: () => Array<{ messageID: string; partID: string; role: string; partIndex: number; offset: number; questionField?: string }>
 }>()
 
 function use() {
   const ctx = useContext(context)
   if (!ctx) throw new Error("useContext must be used within a Session component")
   return ctx
+}
+
+function SearchBar(props: {
+  searchTerm: string
+  matchCount: number
+  matchIndex: number
+  onInput: (term: string) => void
+  onNext: () => void
+  onPrev: () => void
+  onClose: () => void
+}) {
+  const { theme } = useTheme()
+  let input: InputRenderable
+
+  useKeyboard((evt) => {
+    if (evt.name === "escape") {
+      props.onClose()
+      return
+    }
+    if (evt.name === "return" && evt.shift) {
+      props.onPrev()
+      return
+    }
+  })
+
+  const counter = createMemo(() => {
+    const term = props.searchTerm
+    if (!term) return ""
+    if (props.matchCount === 0) return " [no matches]"
+    return ` [${props.matchIndex + 1}/${props.matchCount}]`
+  })
+
+  return (
+    <box flexShrink={0} flexDirection="row" gap={1}>
+      <text fg={theme.accent}>/</text>
+      <input
+        ref={(r) => {
+          input = r
+          setTimeout(() => {
+            if (!input || input.isDestroyed) return
+            input.focus()
+          }, 1)
+        }}
+        onInput={(value) => props.onInput(value)}
+        onSubmit={() => props.onNext()}
+        placeholder="Search"
+        placeholderColor={theme.textMuted}
+        cursorColor={theme.primary}
+        focusedBackgroundColor={theme.background}
+        focusedTextColor={theme.text}
+        flexGrow={1}
+      />
+      <text fg={theme.textMuted}>
+        {counter()}
+        <span style={{ fg: theme.textMuted }}> enter/shift+enter: next/prev, esc: close</span>
+      </text>
+    </box>
+  )
+}
+
+function highlightText(text: string, term: string, theme: any, currentOffset?: number): JSX.Element {
+  if (!term) return text
+  const lower = text.toLowerCase()
+  const lowerTerm = term.toLowerCase()
+  const segments: JSX.Element[] = []
+  let pos = 0
+  let i = lower.indexOf(lowerTerm, pos)
+  while (i !== -1) {
+    if (i > pos) segments.push(text.slice(pos, i))
+    const isCurrent = currentOffset === i
+    segments.push(
+      <span style={{ bg: isCurrent ? theme.accent : theme.secondary, fg: theme.background }}>
+        {text.slice(i, i + term.length)}
+      </span>,
+    )
+    pos = i + term.length
+    i = lower.indexOf(lowerTerm, pos)
+  }
+  if (pos < text.length) segments.push(text.slice(pos))
+  return <>{segments}</>
+}
+
+function applySearchHighlightsToChunks(
+  chunks: any[],
+  term: string,
+  currentMatchIndex: number,
+  accentColor: any,
+  secondaryColor: any,
+  bgColor: any,
+): any[] {
+  if (!term) return chunks
+  const lowerTerm = term.toLowerCase()
+  const result: any[] = []
+  let occurrenceCount = 0
+  for (const chunk of chunks) {
+    if (!chunk.text) {
+      result.push(chunk)
+      continue
+    }
+    const text = chunk.text
+    const lower = text.toLowerCase()
+    let pos = 0
+    let i = lower.indexOf(lowerTerm, pos)
+    if (i === -1) {
+      result.push(chunk)
+      continue
+    }
+    while (i !== -1) {
+      if (i > pos) {
+        result.push({ ...chunk, text: text.slice(pos, i) })
+      }
+      const isCurrent = occurrenceCount === currentMatchIndex
+      result.push({
+        ...chunk,
+        text: text.slice(i, i + term.length),
+        bg: isCurrent ? accentColor : secondaryColor,
+        fg: bgColor,
+      })
+      pos = i + term.length
+      i = lower.indexOf(lowerTerm, pos)
+      occurrenceCount++
+    }
+    if (pos < text.length) {
+      result.push({ ...chunk, text: text.slice(pos) })
+    }
+  }
+  return result
 }
 
 export function Session() {
@@ -283,6 +415,80 @@ export function Session() {
   const toast = useToast()
   const sdk = useSDK()
   const editor = useEditorContext()
+
+  const [searchTerm, setSearchTerm] = createSignal("")
+  const [searchIndex, setSearchIndex] = createSignal(0)
+  const [searchActive, setSearchActive] = createSignal(false)
+  function findVisibleAnchor(): { id: string; offset: number } | undefined {
+    const children = scroll.getChildren()
+    const centerY = scroll.y + scroll.height / 2
+    let best: { id: string; offset: number; dist: number } | undefined
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i]
+      if (!child.id || child.y + child.height <= scroll.y) continue
+      const childCenter = child.y + child.height / 2
+      const dist = Math.abs(childCenter - centerY)
+      if (!best || dist < best.dist) {
+        best = { id: child.id, offset: child.y - scroll.y, dist }
+      }
+    }
+    return best ? { id: best.id, offset: best.offset } : undefined
+  }
+  function restoreScrollAfterLayout(targetId: string, targetOffset: number) {
+    let count = 0
+    const attempt = () => {
+      const child = scroll.findDescendantById(targetId)
+      if (!child) return
+      const current = child.y - scroll.y
+      if (current === targetOffset && count < 5) {
+        count++
+        setTimeout(attempt, 32)
+        return
+      }
+      scroll.scrollBy(child.y - scroll.y - targetOffset)
+    }
+    setTimeout(attempt, 32)
+  }
+  const searchMatches = createMemo(() => {
+    const term = searchTerm().toLowerCase()
+    if (!term) return []
+    const results: Array<{ messageID: string; partID: string; role: string; partIndex: number; offset: number; questionField?: string }> = []
+    for (const message of messages()) {
+      const parts = sync.data.part[message.id] ?? []
+      for (let pi = 0; pi < parts.length; pi++) {
+        const part = parts[pi]
+        if (part.type === "text" && !part.synthetic && !part.ignored) {
+          const text = part.text.toLowerCase()
+          let pos = 0
+          while ((pos = text.indexOf(term, pos)) !== -1) {
+            results.push({ messageID: message.id, partID: part.id, role: message.role, partIndex: pi, offset: pos })
+            pos += term.length
+          }
+        }
+        if (part.type === "tool" && part.tool === "question" && part.state.status === "completed") {
+          const questions = (part.state.input as any)?.questions as Array<{ question: string; options?: Array<{ label: string; description: string }> }> | undefined
+          const answers = (part.state.metadata as any)?.answers as Array<ReadonlyArray<string>> | undefined
+          const fields: Array<{ field: string; text: string }> = []
+          for (let qi = 0; qi < (questions ?? []).length; qi++) {
+            const q = questions![qi]
+            fields.push({ field: `q-${qi}`, text: q.question })
+            for (const a of answers?.[qi] ?? []) {
+              fields.push({ field: `a-${qi}`, text: a })
+            }
+          }
+          for (const { field, text } of fields) {
+            const lower = text.toLowerCase()
+            let pos = 0
+            while ((pos = lower.indexOf(term, pos)) !== -1) {
+              results.push({ messageID: message.id, partID: part.id, role: message.role, partIndex: pi, offset: pos, questionField: field })
+              pos += term.length
+            }
+          }
+        }
+      }
+    }
+    return results
+  })
 
   createEffect(() => {
     const sessionID = route.sessionID
@@ -750,6 +956,23 @@ export function Session() {
       },
     },
     {
+      title: "Search in messages",
+      value: "session.search",
+      category: "Session",
+      slash: {
+        name: "search",
+        aliases: ["find"],
+      },
+      run: () => {
+        const visible = findVisibleAnchor()
+        dialog.clear()
+        setSearchActive(true)
+        setSearchTerm("")
+        setSearchIndex(0)
+        if (visible) restoreScrollAfterLayout(visible.id, visible.offset)
+      },
+    },
+    {
       title: "Page up",
       value: "session.page.up",
       category: "Session",
@@ -1173,6 +1396,10 @@ export function Session() {
           providers,
           sync,
           tui: tuiConfig,
+          searchTerm,
+          searchIndex,
+          searchActive,
+          searchMatches,
         }}
       >
         <box flexDirection="row" flexGrow={1} minHeight={0}>
@@ -1191,7 +1418,7 @@ export function Session() {
                     foregroundColor: theme.border,
                   },
                 }}
-                stickyScroll={true}
+                stickyScroll={!searchActive()}
                 stickyStart="bottom"
                 flexGrow={1}
                 scrollAcceleration={scrollAcceleration()}
@@ -1294,6 +1521,59 @@ export function Session() {
                   )}
                 </For>
               </scrollbox>
+              <Show when={searchActive()}>
+                <SearchBar
+                  searchTerm={searchTerm()}
+                  matchCount={searchMatches().length}
+                  matchIndex={searchIndex()}
+                  onInput={(term) => {
+                    setSearchTerm(term)
+                    setSearchIndex(0)
+                  }}
+                  onNext={() => {
+                    const matches = searchMatches()
+                    if (matches.length === 0) return
+                    const next = (searchIndex() + 1) % matches.length
+                    setSearchIndex(next)
+                    const m = matches[next]
+                    const scrollId = m.role === "user" ? m.messageID : "text-" + m.partID
+                    const child = scroll.findDescendantById(scrollId)
+                    if (child) scroll.scrollBy(child.y - scroll.y - 1)
+                  }}
+                  onPrev={() => {
+                    const matches = searchMatches()
+                    if (matches.length === 0) return
+                    const prev = (searchIndex() - 1 + matches.length) % matches.length
+                    setSearchIndex(prev)
+                    const m = matches[prev]
+                    const scrollId = m.role === "user" ? m.messageID : "text-" + m.partID
+                    const child = scroll.findDescendantById(scrollId)
+                    if (child) scroll.scrollBy(child.y - scroll.y - 1)
+                  }}
+                  onClose={() => {
+                    const match = searchMatches()[searchIndex()]
+                    let captureId: string | undefined
+                    let captureOffset: number | undefined
+                    if (match) {
+                      captureId = match.role === "user" ? match.messageID : "text-" + match.partID
+                      const child = scroll.findDescendantById(captureId)
+                      if (child) captureOffset = child.y - scroll.y
+                    } else {
+                      const visible = findVisibleAnchor()
+                      if (visible) {
+                        captureId = visible.id
+                        captureOffset = visible.offset
+                      }
+                    }
+                    setSearchTerm("")
+                    setSearchIndex(0)
+                    setSearchActive(false)
+                    if (captureId && captureOffset !== undefined) {
+                      restoreScrollAfterLayout(captureId, captureOffset)
+                    }
+                  }}
+                />
+              </Show>
               <box flexShrink={0}>
                 <Show when={permissions().length > 0}>
                   <PermissionPrompt
@@ -1310,7 +1590,7 @@ export function Session() {
                 <Show when={session()?.parentID}>
                   <SubagentFooter />
                 </Show>
-                <Show when={visible()}>
+                <Show when={visible() && !searchActive()}>
                   <pluginRuntime.Slot
                     name="session_prompt"
                     mode="replace"
@@ -1392,6 +1672,17 @@ function UserMessage(props: {
 
   const compaction = createMemo(() => props.parts.find((x) => x.type === "compaction"))
 
+  const highlightedText = createMemo(() => {
+    const term = ctx.searchTerm()
+    const t = text()
+    if (!term || !t) return t
+    const matches = ctx.searchMatches()
+    const idx = ctx.searchIndex()
+    const current = matches[idx]
+    const currentOff = current?.messageID === props.message.id ? current.offset : undefined
+    return highlightText(t, term, theme, currentOff)
+  })
+
   return (
     <>
       <Show when={text()}>
@@ -1417,7 +1708,7 @@ function UserMessage(props: {
             backgroundColor={hover() ? theme.backgroundElement : theme.backgroundPanel}
             flexShrink={0}
           >
-            <text fg={theme.text}>{text()}</text>
+            <text fg={theme.text}>{highlightedText()}</text>
             <Show when={files().length}>
               <box flexDirection="row" paddingBottom={metadataVisible() ? 1 : 0} paddingTop={1} gap={1} flexWrap="wrap">
                 <For each={files()}>
@@ -1687,19 +1978,65 @@ function ReasoningHeader(props: {
 function TextPart(props: { last: boolean; part: TextPart; message: AssistantMessage }) {
   const ctx = use()
   const { theme, syntax } = useTheme()
+  let codeRef: any
+  const searchHighlightArgs = createMemo(() => {
+    const term = ctx.searchTerm()
+    if (!term) return null
+    const matches = ctx.searchMatches()
+    let currentMatchIndex = -1
+    let count = 0
+    for (const m of matches) {
+      if (m.partID === props.part.id) {
+        if (m.messageID === props.message.id && count === ctx.searchIndex()) {
+          currentMatchIndex = count
+        }
+        count++
+      }
+    }
+    if (count === 0) return null
+    return { term, currentMatchIndex }
+  })
+  const onChunksCallback = (chunks: any[], _chunkCtx: any) => {
+    const args = searchHighlightArgs()
+    if (!args) return chunks
+    return applySearchHighlightsToChunks(chunks, args.term, args.currentMatchIndex, theme.accent, theme.secondary, theme.background)
+  }
+  createEffect(() => {
+    const _args = searchHighlightArgs()
+    if (codeRef) {
+      codeRef._highlightsDirty = true
+    }
+  })
   return (
     <Show when={props.part.text.trim()}>
-      <box ref={(el: BoxRenderable) => alwaysSeparate.add(el)} paddingLeft={3} marginTop={1} flexShrink={0}>
-        <markdown
-          syntaxStyle={syntax()}
-          streaming={true}
-          internalBlockMode="top-level"
-          content={props.part.text.trim()}
-          tableOptions={{ style: "grid" }}
-          conceal={ctx.conceal()}
-          fg={theme.markdownText}
-          bg={theme.background}
-        />
+      <box id={"text-" + props.part.id} ref={(el: BoxRenderable) => alwaysSeparate.add(el)} paddingLeft={3} marginTop={1} flexShrink={0}>
+        <Show when={!ctx.searchActive()}>
+          <markdown
+            syntaxStyle={syntax()}
+            streaming={true}
+            internalBlockMode="top-level"
+            content={props.part.text.trim()}
+            tableOptions={{ style: "grid" }}
+            conceal={ctx.conceal()}
+            fg={theme.markdownText}
+            bg={theme.background}
+          />
+        </Show>
+        <Show when={ctx.searchActive()}>
+          <code
+            ref={(r: any) => {
+              codeRef = r
+            }}
+            filetype="markdown"
+            drawUnstyledText={false}
+            streaming={true}
+            syntaxStyle={syntax()}
+            content={props.part.text.trim()}
+            conceal={ctx.conceal()}
+            fg={theme.text}
+            onChunks={onChunksCallback}
+          />
+        </Show>
       </box>
     </Show>
   )
@@ -2550,6 +2887,7 @@ function TodoWrite(props: ToolProps) {
 
 function Question(props: ToolProps) {
   const { theme } = useTheme()
+  const ctx = use()
   const questions = createMemo(() => parseQuestions(props.input.questions))
   const answers = createMemo(() => parseQuestionAnswers(props.metadata.answers))
   const count = createMemo(() => questions().length)
@@ -2557,6 +2895,22 @@ function Question(props: ToolProps) {
   function format(answer?: ReadonlyArray<string>) {
     if (!answer?.length) return "(no answer)"
     return answer.join(", ")
+  }
+
+  const currentMatch = createMemo(() => {
+    const matches = ctx.searchMatches()
+    const idx = ctx.searchIndex()
+    const m = matches[idx]
+    if (!m || m.partID !== props.part.id) return undefined
+    return m
+  })
+
+  function highlight(text: string, field: string) {
+    const term = ctx.searchTerm()
+    if (!term) return text
+    const m = currentMatch()
+    const currentOff = m?.questionField === field ? m.offset : undefined
+    return highlightText(text, term, theme, currentOff)
   }
 
   return (
@@ -2567,8 +2921,8 @@ function Question(props: ToolProps) {
             <For each={questions()}>
               {(q, i) => (
                 <box flexDirection="column">
-                  <text fg={theme.textMuted}>{q.question}</text>
-                  <text fg={theme.text}>{format(answers()?.[i()])}</text>
+                  <text fg={theme.textMuted}>{highlight(q.question, `q-${i()}`)}</text>
+                  <text fg={theme.text}>{highlight(format(answers()?.[i()]), `a-${i()}`)}</text>
                 </box>
               )}
             </For>
